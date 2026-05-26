@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import main; print\\('OK'\\)\")",
+      "Bash(timeout 5 python main.py)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":8000\")",
+      "Bash(taskkill /F /PID 21928)",
+      "Bash(powershell \"Stop-Process -Id 21928 -Force\")",
+      "Bash(kill -9 23368)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
