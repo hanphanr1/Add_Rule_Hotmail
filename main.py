@@ -227,6 +227,8 @@ def login(email: str, password: str) -> str:
                   headers={'Content-Type': 'application/x-www-form-urlencoded',
                            'Origin': 'https://login.live.com', 'Referer': r.url})
     log_worker(f"[LOGIN] Step 4: Got response, status={resp.status_code}")
+
+    loc = resp.headers.get('Location', '')
     log_worker(f"[LOGIN] Step 5: Location header present: {bool(loc)}")
 
     # Check for error responses in Location header
