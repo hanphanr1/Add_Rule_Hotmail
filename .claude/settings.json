@@ -8,7 +8,10 @@
       "Bash(taskkill /F /PID 21928)",
       "Bash(powershell \"Stop-Process -Id 21928 -Force\")",
       "Bash(kill -9 23368)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }

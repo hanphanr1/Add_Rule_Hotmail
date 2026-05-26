@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
+import traceback
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from fastapi.responses import HTMLResponse
@@ -103,9 +104,13 @@ executor = ThreadPoolExecutor(max_workers=10)
 # ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    set_loop(asyncio.get_event_loop())
     if BOT_TOKEN:
         asyncio.create_task(start_telegram_bot())
     yield
+    with _loop_lock:
+        global _loop
+        _loop = None
 
 
 # ==================== FASTAPI APP ====================
@@ -126,22 +131,48 @@ async def websocket_endpoint(websocket: WebSocket):
             connected_ws.remove(websocket)
 
 
+# Global event loop for broadcasting
+_loop = None
+_loop_lock = threading.Lock()
+
+def set_loop(loop):
+    global _loop
+    with _loop_lock:
+        _loop = loop
+
 def broadcast(data: dict):
     """Thread-safe broadcast"""
-    for ws in connected_ws:
-        try:
-            asyncio.get_event_loop().create_task(ws.send_json(data))
-        except Exception:
-            pass
+    global _loop
+    with _loop_lock:
+        if _loop is not None and _loop.is_running():
+            for ws in connected_ws:
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send_json(data), _loop)
+                except Exception as e:
+                    print(f"[WS ERROR] {e}")
+        else:
+            for ws in connected_ws:
+                try:
+                    asyncio.run(ws.send_json(data))
+                except Exception as e:
+                    print(f"[WS ERROR] {e}")
 
 
 def broadcast_from_thread(data: dict):
-    """Call from background thread"""
-    try:
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(lambda: broadcast(data))
-    except Exception:
-        pass
+    """Call from background thread - thread-safe broadcast"""
+    global _loop
+    with _loop_lock:
+        if _loop is not None:
+            for ws in connected_ws:
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send_json(data), _loop)
+                except Exception as e:
+                    print(f"[BROADCAST ERROR] {e}")
+
+
+def log_worker(msg: str):
+    """Log from worker thread"""
+    print(f"[WORKER] {msg}")
 
 
 # ==================== RULE ENGINE (CORE) ====================
@@ -300,6 +331,7 @@ NETFLIX_CHECK_DEFS = {
 # ==================== WORKER FUNCTIONS ====================
 def do_check_account(email: str, password: str, domain: str, api: str, auto_enable: bool, auto_create: bool) -> Dict:
     """Check one account - login, list rules, auto-enable, auto-create"""
+    log_worker(f"[CHECK] Starting for {email}")
     result = {
         'email': email, 'status': 'PENDING', 'rules_total': 0,
         'rules_enabled': 0, 'rules_disabled': 0, 'fixed': 0, 'created': 0,
@@ -307,7 +339,9 @@ def do_check_account(email: str, password: str, domain: str, api: str, auto_enab
     }
 
     try:
+        log_worker(f"[CHECK] Logging in {email}")
         token = login(email, password)
+        log_worker(f"[CHECK] Logged in, listing rules for {email}")
         rules = list_rules(token, api)
         result['rules_total'] = len(rules)
 
@@ -379,19 +413,25 @@ def do_check_account(email: str, password: str, domain: str, api: str, auto_enab
 
 def do_create_rules(email: str, password: str, rules: List[str], domain: str, api: str) -> Dict:
     """Create rules for one account"""
+    log_worker(f"[CREATE] Starting for {email}")
     result = {'email': email, 'status': 'PENDING', 'rules_ok': 0, 'rules_total': 0, 'error': ''}
 
     try:
+        log_worker(f"[CREATE] Logging in {email}")
         token = login(email, password)
+        log_worker(f"[CREATE] Logged in, building rules for {email}")
         rule_list = build_rules(email, domain, rules)
         result['rules_total'] = len(rule_list)
+        log_worker(f"[CREATE] Creating {len(rule_list)} rules for {email}")
 
         for rule in rule_list:
             r = create_rule(token, rule, api)
             if r.status_code < 400:
                 result['rules_ok'] += 1
+                log_worker(f"[CREATE] Rule OK: {rule['displayName']}")
             else:
                 result['error'] = f"Rule fail: {r.status_code}"
+                log_worker(f"[CREATE] Rule FAIL: {r.status_code} - {r.text[:100]}")
 
         if result['rules_ok'] == result['rules_total'] and result['rules_total'] > 0:
             result['status'] = 'SUCCESS'
