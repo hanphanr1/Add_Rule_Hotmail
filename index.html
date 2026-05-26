@@ -1135,16 +1135,19 @@ email2@hotmail.com:password2"></textarea>
         function handleWSMessage(data) {
             switch (data.type) {
                 case 'check_result':
-                    const checkIcon = data.data.status === 'OK' || data.data.status === 'FIXED' ? '✅' :
-                                      data.data.status === 'PARTIAL' ? '⚠️' : '❌';
-                    logCheck(checkIcon, `${data.data.email}: ${data.data.status}`);
+                    const r = data.data;
+                    const checkIcon = r.status === 'OK' || r.status === 'FIXED' ? '✅' :
+                                      r.status === 'PARTIAL' ? '⚠️' : '❌';
+                    const rulesInfo = `Rules: ${r.rules_total} | Enabled: ${r.rules_enabled} | Created: ${r.created || 0} | Fixed: ${r.fixed || 0}`;
+                    logCheck(checkIcon, `[${r.email}] ${r.status} | ${rulesInfo} | ${r.error || ''}`);
                     loadStats();
                     loadAccounts();
                     break;
                 case 'create_result':
-                    const createIcon = data.data.status === 'SUCCESS' ? '✅' :
-                                       data.data.status === 'PARTIAL' ? '⚠️' : '❌';
-                    log(createIcon, `${data.data.email}: ${data.data.status}`);
+                    const cr = data.data;
+                    const createIcon = cr.status === 'SUCCESS' ? '✅' :
+                                       cr.status === 'PARTIAL' ? '⚠️' : '❌';
+                    log(createIcon, `[${cr.email}] ${cr.status} | Created: ${cr.rules_ok}/${cr.rules_total} | ${cr.error || ''}`);
                     loadStats();
                     loadAccounts();
                     break;
