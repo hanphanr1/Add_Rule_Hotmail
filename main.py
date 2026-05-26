@@ -167,7 +167,10 @@ def broadcast_ws(data: dict):
     """Send to WebSocket clients"""
     for ws in connected_ws:
         try:
-            asyncio.create_task(ws.send_json(data))
+            if asyncio.get_event_loop().is_running():
+                asyncio.create_task(ws.send_json(data))
+            else:
+                asyncio.run(ws.send_json(data))
         except Exception:
             pass
 
