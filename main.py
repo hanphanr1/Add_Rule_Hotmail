@@ -192,7 +192,9 @@ def login(email: str, password: str) -> str:
         f'&redirect_uri={urllib.parse.quote(REDIRECT_URI)}'
     )
 
-    r = s.get(auth_url, timeout=15)
+    log_worker(f"[LOGIN] Step 1: Getting auth page for {email}")
+    r = s.get(auth_url, timeout=30)
+    log_worker(f"[LOGIN] Step 2: Got auth page, searching for urlPost/PPFT")
 
     url_match = (
         re.search(r'urlPost":"([^"]+)"', r.text) or
@@ -207,10 +209,12 @@ def login(email: str, password: str) -> str:
     )
 
     if not url_match or not ppft_match:
+        log_worker(f"[LOGIN] FAIL: Cannot find PPFT/urlPost in response")
         raise Exception('Cannot find PPFT/urlPost')
 
     url_post = url_match.group(1).replace('\\/', '/')
     ppft = ppft_match.group(1)
+    log_worker(f"[LOGIN] Step 3: Posting credentials to {url_post[:50]}...")
 
     data = (
         f'i13=1&login={urllib.parse.quote(email)}&loginfmt={urllib.parse.quote(email)}'
@@ -219,34 +223,48 @@ def login(email: str, password: str) -> str:
         f'&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&i19=9960'
     )
 
-    resp = s.post(url_post, data=data, allow_redirects=False, timeout=15,
+    resp = s.post(url_post, data=data, allow_redirects=False, timeout=30,
                   headers={'Content-Type': 'application/x-www-form-urlencoded',
                            'Origin': 'https://login.live.com', 'Referer': r.url})
+    log_worker(f"[LOGIN] Step 4: Got response, status={resp.status_code}")
+    log_worker(f"[LOGIN] Step 5: Location header present: {bool(loc)}")
 
-    loc = resp.headers.get('Location', '')
+    # Check for error responses in Location header
+    if 'error' in loc.lower():
+        log_worker(f"[LOGIN] FAIL: Error in location: {loc[:100]}")
+        raise Exception(f'Auth error: {loc[:100]}')
+
     m = re.search(r'code=([^&]+)', loc)
 
     if not m:
         body = resp.text.lower()
+        log_worker(f"[LOGIN] FAIL: No code in location. Body preview: {body[:200]}")
         if 'incorrect' in body or 'wrong' in body:
             raise Exception('Sai mật khẩu')
         if 'verify' in body or 'identity' in body:
             raise Exception('Cần verify (2FA / identity)')
+        if 'blocked' in body or 'suspended' in body:
+            raise Exception('Account blocked/suspended')
         raise Exception('Không lấy được auth code')
 
     code = urllib.parse.unquote(m.group(1))
+    log_worker(f"[LOGIN] Step 6: Got code, exchanging for token")
 
     rt = s.post(
         'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
         data={'client_info': '1', 'client_id': CLIENT_ID, 'redirect_uri': REDIRECT_URI,
               'grant_type': 'authorization_code', 'code': code, 'scope': SCOPE},
-        timeout=20,
+        timeout=30,
     )
+    log_worker(f"[LOGIN] Step 7: Token response status: {rt.status_code}")
 
     if 'access_token' not in rt.text:
+        log_worker(f"[LOGIN] FAIL: No access_token in response")
         raise Exception(f'Token fail: {rt.text[:200]}')
 
-    return rt.json()['access_token']
+    token = rt.json()['access_token']
+    log_worker(f"[LOGIN] SUCCESS for {email}")
+    return token
 
 
 def build_rules(email: str, redirect_domain: str, selected: List[str]) -> List[Dict]:
@@ -405,6 +423,7 @@ def do_check_account(email: str, password: str, domain: str, api: str, auto_enab
     except Exception as e:
         result['status'] = 'LOGIN_FAILED'
         result['error'] = str(e)
+        log_worker(f"[CHECK] EXCEPTION for {email}: {e}")
         AccountStore.upsert(email, password, last_check=result['last_check'], status='LOGIN_FAILED')
 
     broadcast_from_thread({'type': 'check_result', 'data': result})
@@ -449,6 +468,7 @@ def do_create_rules(email: str, password: str, rules: List[str], domain: str, ap
     except Exception as e:
         result['status'] = 'LOGIN_FAILED'
         result['error'] = str(e)
+        log_worker(f"[CREATE] EXCEPTION for {email}: {e}")
 
     broadcast_from_thread({'type': 'create_result', 'data': result})
     return result
