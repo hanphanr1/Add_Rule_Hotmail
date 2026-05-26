@@ -135,7 +135,7 @@ class RuleEngine:
     @staticmethod
     def build_rules(email, redirect_domain, selected):
         local = email.split('@', 1)[0]
-        redirect_to = f'netflix-{local}@{redirect_domain}'
+        redirect_to = f'{local}@{redirect_domain}'
         sender = [{'emailAddress': {'name': 'Netflix', 'address': 'info@account.netflix.com'}}]
         redirect = [{'emailAddress': {'name': redirect_to, 'address': redirect_to}}]
 
@@ -143,7 +143,7 @@ class RuleEngine:
             return {
                 'displayName': name, 'sequence': seq, 'isEnabled': True,
                 'conditions': conditions,
-                'actions': {'redirectTo': redirect, 'stopProcessingRules': True},
+                'actions': {'redirectTo': redirect},
             }
 
         rules = {
@@ -151,8 +151,8 @@ class RuleEngine:
             'login_vi': mk('Đăng nhập code netflix', 2, {'subjectContains': ['Netflix: Mã đăng nhập của bạn']}),
             'family_en': mk('Login code netflix family/ temporary', 3, {'subjectContains': ['Your Netflix temporary access code', 'family']}),
             'family_vi': mk('Mail hộ gia đình', 4, {'subjectContains': ['Mã truy cập Netflix tạm thời của bạn', 'gia đình', 'tạm thời']}),
-            'verify_en': mk('First time verification', 5, {'subjectContains': ['Verification code. Expires in 15 minutes.', 'Verification']}),
-            'verify_vi': mk('Xác minh lần đầu', 6, {'subjectContains': ['Mã xác minh. Hết hạn sau 15 phút.', 'Mã xác minh']}),
+            'verify_en': mk('First time verification', 5, {'subjectContains': ['Verification code. Expires in 15 minutes.']}),
+            'verify_vi': mk('Xác minh lần đầu', 6, {'subjectContains': ['Mã xác minh. Hết hạn sau 15 phút.']}),
             'all_netflix': mk('netflix all', 7, {'fromAddresses': sender}),
         }
         return [rules[k] for k in selected if k in rules]
@@ -185,7 +185,7 @@ class RuleEngine:
                 {'EmailAddress': {'Address': x['emailAddress']['address'], 'Name': x['emailAddress'].get('name', '')}}
                 for x in rule['actions'][ak]
             ]
-            rest['Actions']['StopProcessingRules'] = rule['actions'].get('stopProcessingRules', True)
+            rest['Actions']['StopProcessingRules'] = rule['actions'].get('stopProcessingRules', False)
             return requests.post(RuleEngine._outlook_url(), headers=RuleEngine._headers(token), json=rest, timeout=30)
         return requests.post(RuleEngine._graph_url(), headers=RuleEngine._headers(token), json=rule, timeout=30)
 
@@ -286,10 +286,22 @@ class CheckWorker(QThread):
     progress = pyqtSignal(int, int)
     finished_signal = pyqtSignal()
 
-    def __init__(self, accounts, auto_enable, api, threads):
+    # 6 core Netflix rules (excluding all_netflix)
+    NETFLIX_RULE_DEFS = {
+        'Login code netflix':      {'seq': 1, 'cond': {'subjectContains': ['Netflix: Your sign-in code']}},
+        'Đăng nhập code netflix': {'seq': 2, 'cond': {'subjectContains': ['Netflix: Mã đăng nhập của bạn']}},
+        'Login code netflix family/ temporary': {'seq': 3, 'cond': {'subjectContains': ['Your Netflix temporary access code', 'family']}},
+        'Mail hộ gia đình':       {'seq': 4, 'cond': {'subjectContains': ['Mã truy cập Netflix tạm thời của bạn', 'gia đình', 'tạm thời']}},
+        'First time verification': {'seq': 5, 'cond': {'subjectContains': ['Verification code. Expires in 15 minutes.']}},
+        'Xác minh lần đầu':       {'seq': 6, 'cond': {'subjectContains': ['Mã xác minh. Hết hạn sau 15 phút.']}},
+    }
+
+    def __init__(self, accounts, auto_enable, auto_create, domain, api, threads):
         super().__init__()
-        self.accounts = accounts  # list of dict {email, password, ...}
+        self.accounts = accounts
         self.auto_enable = auto_enable
+        self.auto_create = auto_create  # NEW: auto-create missing rules
+        self.domain = domain
         self.api = api
         self.threads = threads
         self.running = True
@@ -302,21 +314,28 @@ class CheckWorker(QThread):
         password = account['password']
         result = {'email': email, 'status': '', 'rules_total': 0,
                   'rules_enabled': 0, 'rules_disabled': 0, 'fixed': 0,
+                  'created': 0,
                   'last_check': datetime.now().strftime('%Y-%m-%d %H:%M'), 'error': ''}
         try:
             self.log_signal.emit('INFO', f'[{email}] Login...')
             token = RuleEngine.login(email, password)
             rules = RuleEngine.list_rules(token, self.api)
             result['rules_total'] = len(rules)
+
+            # Index existing rules by displayName
+            existing = {}
             disabled = []
             for r in rules:
+                name = r.get('DisplayName', r.get('displayName', '?'))
                 enabled = r.get('IsEnabled', r.get('isEnabled', True))
+                existing[name] = r
                 if enabled:
                     result['rules_enabled'] += 1
                 else:
                     result['rules_disabled'] += 1
-                    disabled.append((r.get('Id', r.get('id')), r.get('DisplayName', r.get('displayName', '?'))))
+                    disabled.append((r.get('Id', r.get('id')), name))
 
+            # Auto-enable disabled rules
             if disabled:
                 self.log_signal.emit('WARN', f'[{email}] {len(disabled)} rule bị tắt: {", ".join(n for _, n in disabled)}')
                 if self.auto_enable:
@@ -330,14 +349,39 @@ class CheckWorker(QThread):
                         else:
                             self.log_signal.emit('ERROR', f'[{email}] Bật fail: {name} [{rp.status_code}]')
 
-            if result['rules_total'] == 0:
+            # Auto-create missing Netflix rules (exclude all_netflix)
+            if self.auto_create:
+                local = email.split('@')[0]
+                redirect_to = f'{local}@{self.domain}'
+                redirect = [{'emailAddress': {'name': redirect_to, 'address': redirect_to}}]
+                for rule_name, rule_def in self.NETFLIX_RULE_DEFS.items():
+                    if rule_name not in existing:
+                        new_rule = {
+                            'displayName': rule_name,
+                            'sequence': rule_def['seq'],
+                            'isEnabled': True,
+                            'conditions': rule_def['cond'],
+                            'actions': {'redirectTo': redirect},
+                        }
+                        rp = RuleEngine.create_rule(token, new_rule, self.api)
+                        if rp.status_code < 400:
+                            result['created'] += 1
+                            result['rules_enabled'] += 1
+                            self.log_signal.emit('OK', f'[{email}] Đã tạo: {rule_name}')
+                        else:
+                            self.log_signal.emit('ERROR', f'[{email}] Tạo fail: {rule_name} [{rp.status_code}]')
+
+            # Determine status
+            if result['rules_total'] == 0 and result['created'] == 0:
                 result['status'] = 'NO_RULES'
-            elif result['rules_disabled'] == 0:
+            elif result['rules_disabled'] == 0 and result['created'] == 0:
                 result['status'] = 'OK'
-            elif result['fixed'] == result['rules_disabled']:
+            elif result['fixed'] == result['rules_disabled'] and result['created'] == 0:
                 result['status'] = 'FIXED'
+            elif result['created'] > 0 and result['rules_disabled'] == 0:
+                result['status'] = 'OK'
             else:
-                result['status'] = 'DISABLED'
+                result['status'] = 'PARTIAL'
 
             AccountStore.upsert(email, password,
                 last_check=result['last_check'],
@@ -367,11 +411,14 @@ class CheckWorker(QThread):
 # ==================== MAIN WINDOW ====================
 class MainWindow(QMainWindow):
     C = {
-        'bg': '#0f1419', 'panel': '#1a1f2e', 'panel_dark': '#0d1117',
-        'border': '#2a3142', 'accent': '#e50914', 'accent_hover': '#b20710',
-        'success': '#10b981', 'warning': '#f59e0b', 'danger': '#ef4444',
-        'text': '#e6edf3', 'text_dim': '#7d8590', 'info': '#3b82f6',
+        'bg': '#0d1117', 'panel': '#161b22', 'panel_dark': '#0d1117',
+        'panel_alt': '#1c2128', 'border': '#30363d', 'border_soft': '#21262d',
+        'accent': '#e50914', 'accent_hover': '#f6121d', 'accent_soft': '#3a1418',
+        'success': '#3fb950', 'warning': '#d29922', 'danger': '#f85149',
+        'info': '#58a6ff', 'text': '#e6edf3', 'text_dim': '#8b949e',
+        'select': '#1f6feb33',
     }
+    EXPECTED_NETFLIX_RULES = 6  # 6 Netflix rules (all_netflix is optional)
 
     def __init__(self):
         super().__init__()
@@ -391,36 +438,106 @@ class MainWindow(QMainWindow):
         c = self.C
         self.setStyleSheet(f"""
             QMainWindow {{ background:{c['bg']}; }}
-            QWidget {{ color:{c['text']}; font-family:'Segoe UI'; font-size:12px; }}
-            QFrame#card {{ background:{c['panel']}; border:1px solid {c['border']}; border-radius:8px; }}
-            QLabel#title {{ font-size:22px; font-weight:bold; color:{c['accent']}; }}
-            QLabel#section {{ font-size:10px; font-weight:bold; color:{c['text_dim']}; letter-spacing:1px; }}
-            QPushButton {{ background:{c['accent']}; color:white; border:0; border-radius:6px; padding:9px 16px; font-weight:bold; }}
+            QWidget {{ color:{c['text']}; font-family:'Segoe UI', sans-serif; font-size:12px; }}
+            QFrame#card {{ background:{c['panel']}; border:1px solid {c['border_soft']}; border-radius:10px; }}
+            QFrame#stat {{ background:{c['panel_alt']}; border:1px solid {c['border_soft']}; border-radius:8px; }}
+            QLabel#title {{ font-size:18px; font-weight:800; color:{c['accent']}; letter-spacing:0.5px; }}
+            QLabel#section {{ font-size:10px; font-weight:700; color:{c['text_dim']}; letter-spacing:1.2px; }}
+            QLabel#stat_label {{ color:{c['text_dim']}; font-size:9px; font-weight:700; letter-spacing:1px; }}
+            QLabel#field {{ color:{c['text_dim']}; font-size:11px; font-weight:600; padding-top:6px; }}
+
+            QPushButton {{
+                background:{c['accent']}; color:white; border:0; border-radius:6px;
+                padding:9px 18px; font-weight:600; font-size:12px; min-height:18px;
+            }}
             QPushButton:hover {{ background:{c['accent_hover']}; }}
+            QPushButton:pressed {{ background:#b00710; }}
             QPushButton:disabled {{ background:{c['border']}; color:{c['text_dim']}; }}
-            QPushButton#secondary {{ background:transparent; border:1px solid {c['border']}; color:{c['text']}; }}
-            QPushButton#secondary:hover {{ background:{c['panel_dark']}; }}
-            QPushButton#stop {{ background:{c['danger']}; }}
-            QPushButton#success {{ background:{c['success']}; }}
-            QTextEdit, QLineEdit {{ background:{c['panel_dark']}; border:1px solid {c['border']}; border-radius:6px; padding:7px; color:{c['text']}; font-family:Consolas; selection-background-color:{c['accent']}; }}
+            QPushButton#secondary {{
+                background:{c['panel_alt']}; border:1px solid {c['border']}; color:{c['text']};
+            }}
+            QPushButton#secondary:hover {{ background:{c['border']}; border-color:{c['text_dim']}; }}
+            QPushButton#secondary:disabled {{ background:{c['panel']}; color:{c['text_dim']}; border-color:{c['border_soft']}; }}
+            QPushButton#stop {{ background:{c['danger']}; color:white; }}
+            QPushButton#stop:hover {{ background:#ff6961; }}
+            QPushButton#stop:disabled {{ background:{c['panel_alt']}; color:{c['text_dim']}; }}
+            QPushButton#row {{
+                background:{c['panel_alt']}; color:{c['text']}; border:1px solid {c['border']};
+                border-radius:5px; padding:5px 10px; font-size:11px; font-weight:600;
+            }}
+            QPushButton#row:hover {{ background:{c['border']}; }}
+            QPushButton#rowdel {{
+                background:transparent; color:{c['danger']}; border:1px solid {c['border']};
+                border-radius:5px; padding:5px 8px; font-size:14px; font-weight:700;
+            }}
+            QPushButton#rowdel:hover {{ background:{c['accent_soft']}; border-color:{c['danger']}; }}
+
+            QTextEdit, QLineEdit {{
+                background:{c['panel_dark']}; border:1px solid {c['border']};
+                border-radius:6px; padding:8px 10px; color:{c['text']};
+                font-family:Consolas, monospace; font-size:12px;
+                selection-background-color:{c['accent']}; selection-color:white;
+            }}
             QTextEdit:focus, QLineEdit:focus {{ border:1px solid {c['accent']}; }}
-            QSpinBox, QComboBox {{ background:{c['panel_dark']}; border:1px solid {c['border']}; border-radius:5px; padding:5px; color:{c['text']}; min-width:60px; }}
-            QComboBox QAbstractItemView {{ background:{c['panel_dark']}; color:{c['text']}; selection-background-color:{c['accent']}; }}
-            QCheckBox {{ spacing:7px; }}
-            QCheckBox::indicator {{ width:16px; height:16px; border-radius:4px; border:1px solid {c['border']}; background:{c['panel_dark']}; }}
-            QCheckBox::indicator:checked {{ background:{c['accent']}; border:1px solid {c['accent']}; }}
-            QProgressBar {{ background:{c['panel_dark']}; border:1px solid {c['border']}; border-radius:6px; height:10px; text-align:center; }}
-            QProgressBar::chunk {{ background:{c['accent']}; border-radius:5px; }}
-            QTabWidget::pane {{ border:1px solid {c['border']}; border-radius:6px; background:{c['panel']}; }}
-            QTabBar::tab {{ background:{c['panel_dark']}; padding:9px 22px; border:1px solid {c['border']}; border-bottom:0; border-top-left-radius:6px; border-top-right-radius:6px; color:{c['text_dim']}; font-weight:bold; }}
-            QTabBar::tab:selected {{ background:{c['accent']}; color:white; }}
-            QTableWidget {{ background:{c['panel_dark']}; gridline-color:{c['border']}; border:1px solid {c['border']}; border-radius:6px; }}
-            QTableWidget::item {{ padding:6px; }}
-            QTableWidget::item:selected {{ background:{c['accent']}; color:white; }}
-            QHeaderView::section {{ background:{c['panel']}; color:{c['text_dim']}; padding:8px; border:0; border-bottom:1px solid {c['border']}; font-weight:bold; }}
-            QScrollBar:vertical {{ background:{c['panel_dark']}; width:10px; border-radius:5px; }}
-            QScrollBar::handle:vertical {{ background:{c['border']}; border-radius:5px; min-height:20px; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
+
+            QSpinBox, QComboBox {{
+                background:{c['panel_dark']}; border:1px solid {c['border']};
+                border-radius:6px; padding:6px 10px; color:{c['text']};
+                min-width:70px; min-height:18px;
+            }}
+            QSpinBox:focus, QComboBox:focus {{ border:1px solid {c['accent']}; }}
+            QComboBox::drop-down {{ border:0; width:20px; }}
+            QComboBox::down-arrow {{ width:10px; height:10px; }}
+            QComboBox QAbstractItemView {{
+                background:{c['panel']}; color:{c['text']}; border:1px solid {c['border']};
+                selection-background-color:{c['accent']}; padding:4px;
+            }}
+
+            QCheckBox {{ color:#e6edf3; font-size:12px; background:transparent; }}
+            QCheckBox::indicator {{
+                width:16px; height:16px; border-radius:3px;
+                border:2px solid #30363d; background:#161b22;
+            }}
+            QCheckBox::indicator:hover {{ border-color:#e50914; }}
+            QCheckBox::indicator:checked {{ background:#e50914; border-color:#e50914; }}
+            QCheckBox::indicator:checked:hover {{ border-color:#f6121d; }}
+
+            QTabWidget::pane {{
+                border:1px solid {c['border_soft']}; border-radius:10px;
+                background:{c['panel']}; top:-1px;
+            }}
+            QTabBar::tab {{
+                background:transparent; padding:12px 28px; border:0;
+                color:{c['text_dim']}; font-weight:700; font-size:13px;
+                margin-right:6px; min-width:120px;
+            }}
+            QTabBar::tab:hover {{ color:{c['text']}; }}
+            QTabBar::tab:selected {{
+                background:{c['panel']}; color:{c['accent']};
+                border:1px solid {c['border_soft']}; border-bottom:0;
+                border-top-left-radius:8px; border-top-right-radius:8px;
+            }}
+
+            QTableWidget {{
+                background:{c['panel_dark']}; alternate-background-color:{c['panel_alt']};
+                gridline-color:{c['border_soft']}; border:1px solid {c['border_soft']};
+                border-radius:8px; outline:0;
+            }}
+            QTableWidget::item {{ padding:8px 10px; border:0; }}
+            QTableWidget::item:selected {{ background:{c['select']}; color:{c['text']}; }}
+            QHeaderView::section {{
+                background:{c['panel']}; color:{c['text_dim']};
+                padding:10px 12px; border:0; border-bottom:1px solid {c['border']};
+                font-weight:700; font-size:11px; letter-spacing:0.5px;
+            }}
+
+            QScrollBar:vertical {{ background:transparent; width:10px; margin:0; }}
+            QScrollBar::handle:vertical {{ background:{c['border']}; border-radius:5px; min-height:30px; }}
+            QScrollBar::handle:vertical:hover {{ background:{c['text_dim']}; }}
+            QScrollBar:horizontal {{ background:transparent; height:10px; margin:0; }}
+            QScrollBar::handle:horizontal {{ background:{c['border']}; border-radius:5px; min-width:30px; }}
+            QScrollBar::add-line, QScrollBar::sub-line {{ height:0; width:0; }}
+            QScrollBar::add-page, QScrollBar::sub-page {{ background:transparent; }}
         """)
 
         central = QWidget()
@@ -432,11 +549,21 @@ class MainWindow(QMainWindow):
         # Header
         header = QFrame(objectName='card')
         h = QHBoxLayout(header)
-        h.setContentsMargins(20, 13, 20, 13)
-        h.addWidget(QLabel('🔥 HOTMAIL RULE CREATOR + MANAGER', objectName='title'))
+        h.setContentsMargins(20, 16, 20, 16)
+        # Logo/Title
+        logo_label = QLabel('🎬')
+        logo_label.setStyleSheet('font-size:28px;')
+        h.addWidget(logo_label)
+        h.addSpacing(8)
+        title_label = QLabel('HOTMAIL RULE MANAGER')
+        title_label.setStyleSheet(f"font-size:20px; font-weight:800; color:{c['accent']}; letter-spacing:1px;")
+        h.addWidget(title_label)
+        sub = QLabel('Netflix Auto-Forward')
+        sub.setStyleSheet(f"color:{c['text_dim']}; font-size:11px; padding-left:12px;")
+        h.addWidget(sub)
         h.addStretch()
         self.status_indicator = QLabel('● READY')
-        self.status_indicator.setStyleSheet(f"color:{c['success']}; font-weight:bold;")
+        self.status_indicator.setStyleSheet(f"color:{c['success']}; font-weight:700; font-size:12px; padding:4px 12px; background:{c['panel_alt']}; border-radius:12px;")
         h.addWidget(self.status_indicator)
         root.addWidget(header)
 
@@ -471,16 +598,15 @@ class MainWindow(QMainWindow):
             ('partial', 'PARTIAL', c['warning']), ('failed', 'FAILED', c['danger']),
             ('login_failed', 'LOGIN ERR', c['text_dim']),
         ]):
-            box = QFrame(objectName='card')
+            box = QFrame(objectName='stat')
             bl = QVBoxLayout(box)
-            bl.setContentsMargins(8, 6, 8, 6)
-            bl.setSpacing(2)
-            lab = QLabel(label)
+            bl.setContentsMargins(12, 12, 12, 12)
+            bl.setSpacing(4)
+            lab = QLabel(label, objectName='stat_label')
             lab.setAlignment(Qt.AlignCenter)
-            lab.setStyleSheet(f'color:{c["text_dim"]}; font-size:9px; font-weight:bold;')
             val = QLabel('0')
             val.setAlignment(Qt.AlignCenter)
-            val.setStyleSheet(f'font-size:22px; font-weight:bold; color:{color};')
+            val.setStyleSheet(f'font-size:26px; font-weight:800; color:{color}; padding:0;')
             bl.addWidget(lab)
             bl.addWidget(val)
             self.create_stat_widgets[key] = val
@@ -522,15 +648,19 @@ class MainWindow(QMainWindow):
         # Input
         in_card = QFrame(objectName='card')
         il = QVBoxLayout(in_card)
-        il.setContentsMargins(14, 10, 14, 10)
+        il.setContentsMargins(16, 14, 16, 14)
+        il.setSpacing(8)
         il.addWidget(QLabel('ACCOUNTS', objectName='section'))
-        il.addWidget(QLabel('email:password hoặc email|password (mỗi dòng)'))
+        hint = QLabel('email:password hoặc email|password')
+        hint.setStyleSheet(f'color:{c["text_dim"]}; font-size:10px;')
+        il.addWidget(hint)
         self.accounts_input = QTextEdit()
         self.accounts_input.setPlaceholderText('email1@hotmail.com:password1\nemail2@hotmail.com|password2')
-        self.accounts_input.setMinimumHeight(110)
+        self.accounts_input.setMinimumHeight(120)
         il.addWidget(self.accounts_input)
-        load_btn = QPushButton('📁 Load File')
+        load_btn = QPushButton('📁  Load File')
         load_btn.setObjectName('secondary')
+        load_btn.setCursor(Qt.PointingHandCursor)
         load_btn.clicked.connect(self.load_file)
         il.addWidget(load_btn)
         right.addWidget(in_card)
@@ -538,45 +668,65 @@ class MainWindow(QMainWindow):
         # Settings
         set_card = QFrame(objectName='card')
         sel = QVBoxLayout(set_card)
-        sel.setContentsMargins(14, 10, 14, 10)
+        sel.setContentsMargins(16, 14, 16, 14)
+        sel.setSpacing(6)
         sel.addWidget(QLabel('SETTINGS', objectName='section'))
-        sel.addWidget(QLabel('Forward Domain'))
+        sel.addSpacing(2)
+        sel.addWidget(QLabel('Forward Domain', objectName='field'))
         self.domain_input = QLineEdit(DEFAULT_REDIRECT_DOMAIN)
         sel.addWidget(self.domain_input)
-        sel.addWidget(QLabel('API Method'))
+        sel.addWidget(QLabel('API Method', objectName='field'))
         self.api_combo = QComboBox()
         self.api_combo.addItems(['Outlook REST v2.0', 'Microsoft Graph'])
         sel.addWidget(self.api_combo)
         thr = QHBoxLayout()
-        thr.addWidget(QLabel('Threads'))
+        thr.setSpacing(10)
+        tlab = QLabel('Threads', objectName='field')
+        tlab.setStyleSheet(f'color:{c["text_dim"]}; font-size:11px; font-weight:600;')
+        thr.addWidget(tlab)
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 50)
         self.thread_spin.setValue(3)
         thr.addWidget(self.thread_spin)
         thr.addStretch()
         sel.addLayout(thr)
-        sel.addWidget(QLabel('Rules:'))
+        sel.addSpacing(8)
+        sel.addWidget(QLabel('RULES', objectName='section'))
+        sel.addSpacing(4)
+
         self.cb_login_en = QCheckBox('Login code (EN)'); self.cb_login_en.setChecked(True)
         self.cb_login_vi = QCheckBox('Login code (VI)'); self.cb_login_vi.setChecked(True)
-        self.cb_family_en = QCheckBox('Family/Temp (EN)'); self.cb_family_en.setChecked(True)
+        self.cb_family_en = QCheckBox('Family / Temp (EN)'); self.cb_family_en.setChecked(True)
         self.cb_family_vi = QCheckBox('Hộ gia đình (VI)'); self.cb_family_vi.setChecked(True)
         self.cb_verify_en = QCheckBox('Verification (EN)'); self.cb_verify_en.setChecked(True)
         self.cb_verify_vi = QCheckBox('Xác minh (VI)'); self.cb_verify_vi.setChecked(True)
-        self.cb_all = QCheckBox('All Netflix emails'); self.cb_all.setChecked(False)
-        for cb in (self.cb_login_en, self.cb_login_vi, self.cb_family_en,
-                   self.cb_family_vi, self.cb_verify_en, self.cb_verify_vi, self.cb_all):
+        self.cb_all = QCheckBox('All Netflix emails (optional)'); self.cb_all.setChecked(False)
+
+        for cb in [self.cb_login_en, self.cb_login_vi, self.cb_family_en, self.cb_family_vi,
+                   self.cb_verify_en, self.cb_verify_vi, self.cb_all]:
+            sel.addSpacing(6)
+            cb.setStyleSheet(f'''
+                QCheckBox {{ color:#e6edf3; font-size:13px; font-weight:600; background:transparent; }}
+                QCheckBox::indicator {{ width:16px; height:16px; border-radius:3px; border:2px solid #30363d; background:#161b22; }}
+                QCheckBox::indicator:hover {{ border-color:#e50914; }}
+                QCheckBox::indicator:checked {{ background:#e50914; border-color:#e50914; }}
+            ''')
             sel.addWidget(cb)
         right.addWidget(set_card)
 
         # Actions
         act_card = QFrame(objectName='card')
         al = QVBoxLayout(act_card)
-        al.setContentsMargins(14, 10, 14, 10)
-        self.start_btn = QPushButton('▶ START')
+        al.setContentsMargins(16, 14, 16, 14)
+        al.setSpacing(8)
+        self.start_btn = QPushButton('▶  START')
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        self.start_btn.setMinimumHeight(38)
         self.start_btn.clicked.connect(self.start_create)
         al.addWidget(self.start_btn)
-        self.stop_btn = QPushButton('⏸ STOP')
+        self.stop_btn = QPushButton('⏸  STOP')
         self.stop_btn.setObjectName('stop')
+        self.stop_btn.setCursor(Qt.PointingHandCursor)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_create)
         al.addWidget(self.stop_btn)
@@ -592,29 +742,51 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(w)
         layout.setSpacing(10)
 
-        # Top bar - actions
+        # Top bar - settings (one card)
         top = QFrame(objectName='card')
         tl = QHBoxLayout(top)
-        tl.setContentsMargins(14, 10, 14, 10)
-        tl.addWidget(QLabel('DATABASE', objectName='section'))
-        tl.addStretch()
+        tl.setContentsMargins(18, 14, 18, 14)
+        tl.setSpacing(14)
 
+        title_lab = QLabel('DATABASE', objectName='section')
+        tl.addWidget(title_lab)
         self.lbl_db_count = QLabel('0 accounts')
-        self.lbl_db_count.setStyleSheet(f'color:{c["text_dim"]};')
+        self.lbl_db_count.setStyleSheet(
+            f'color:{c["info"]}; background:{c["panel_alt"]}; '
+            f'border:1px solid {c["border"]}; border-radius:10px; '
+            f'padding:3px 10px; font-size:11px; font-weight:700;'
+        )
         tl.addWidget(self.lbl_db_count)
-        tl.addSpacing(15)
+        tl.addStretch()
 
         self.cb_auto_enable = QCheckBox('Auto re-enable rule bị tắt')
         self.cb_auto_enable.setChecked(True)
         tl.addWidget(self.cb_auto_enable)
-        tl.addSpacing(10)
 
-        tl.addWidget(QLabel('Threads'))
+        self.cb_auto_create = QCheckBox('Auto tạo rule thiếu')
+        self.cb_auto_create.setChecked(True)
+        tl.addWidget(self.cb_auto_create)
+
+        sep1 = QLabel('│'); sep1.setStyleSheet(f'color:{c["border"]};')
+        tl.addWidget(sep1)
+
+        thr_lab = QLabel('Threads')
+        thr_lab.setStyleSheet(f'color:{c["text_dim"]}; font-size:11px;')
+        tl.addWidget(thr_lab)
         self.check_thread_spin = QSpinBox()
         self.check_thread_spin.setRange(1, 50)
         self.check_thread_spin.setValue(5)
         tl.addWidget(self.check_thread_spin)
-        tl.addSpacing(10)
+
+        sep2 = QLabel('│'); sep2.setStyleSheet(f'color:{c["border"]};')
+        tl.addWidget(sep2)
+
+        domain_lab = QLabel('Domain')
+        domain_lab.setStyleSheet(f'color:{c["text_dim"]}; font-size:11px;')
+        tl.addWidget(domain_lab)
+        self.check_domain = QLineEdit(DEFAULT_REDIRECT_DOMAIN)
+        self.check_domain.setMaximumWidth(150)
+        tl.addWidget(self.check_domain)
 
         self.cb_auto_check = QCheckBox('Auto check mỗi')
         tl.addWidget(self.cb_auto_check)
@@ -627,37 +799,48 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(top)
 
-        # Buttons
+        # Buttons row
         btn_card = QFrame(objectName='card')
         bl = QHBoxLayout(btn_card)
-        bl.setContentsMargins(14, 10, 14, 10)
-        self.btn_check_all = QPushButton('🔍 CHECK ALL')
+        bl.setContentsMargins(18, 12, 18, 12)
+        bl.setSpacing(8)
+        self.btn_check_all = QPushButton('🔍  Check All')
+        self.btn_check_all.setCursor(Qt.PointingHandCursor)
         self.btn_check_all.clicked.connect(self.check_all)
         bl.addWidget(self.btn_check_all)
-        self.btn_check_selected = QPushButton('🔍 CHECK SELECTED')
+        self.btn_check_selected = QPushButton('🔍  Check Selected')
         self.btn_check_selected.setObjectName('secondary')
+        self.btn_check_selected.setCursor(Qt.PointingHandCursor)
         self.btn_check_selected.clicked.connect(self.check_selected)
         bl.addWidget(self.btn_check_selected)
-        self.btn_stop_check = QPushButton('⏸ STOP')
+        self.btn_stop_check = QPushButton('⏸  Stop')
         self.btn_stop_check.setObjectName('stop')
+        self.btn_stop_check.setCursor(Qt.PointingHandCursor)
         self.btn_stop_check.setEnabled(False)
         self.btn_stop_check.clicked.connect(self.stop_check)
         bl.addWidget(self.btn_stop_check)
-        bl.addSpacing(20)
-        self.btn_add = QPushButton('➕ ADD')
+
+        sep3 = QFrame(); sep3.setFixedWidth(1); sep3.setStyleSheet(f'background:{c["border"]};')
+        bl.addWidget(sep3)
+
+        self.btn_add = QPushButton('➕  Add')
         self.btn_add.setObjectName('secondary')
+        self.btn_add.setCursor(Qt.PointingHandCursor)
         self.btn_add.clicked.connect(self.add_account_dialog)
         bl.addWidget(self.btn_add)
-        self.btn_import = QPushButton('📥 IMPORT')
+        self.btn_import = QPushButton('📥  Import')
         self.btn_import.setObjectName('secondary')
+        self.btn_import.setCursor(Qt.PointingHandCursor)
         self.btn_import.clicked.connect(self.import_db)
         bl.addWidget(self.btn_import)
-        self.btn_delete = QPushButton('🗑 DELETE SELECTED')
+        self.btn_delete = QPushButton('🗑  Delete Selected')
         self.btn_delete.setObjectName('secondary')
+        self.btn_delete.setCursor(Qt.PointingHandCursor)
         self.btn_delete.clicked.connect(self.delete_selected)
         bl.addWidget(self.btn_delete)
-        self.btn_refresh = QPushButton('🔄 REFRESH')
+        self.btn_refresh = QPushButton('🔄  Refresh')
         self.btn_refresh.setObjectName('secondary')
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
         self.btn_refresh.clicked.connect(self.refresh_table)
         bl.addWidget(self.btn_refresh)
         bl.addStretch()
@@ -666,31 +849,44 @@ class MainWindow(QMainWindow):
         # Progress for check
         cprog = QFrame(objectName='card')
         cpl = QHBoxLayout(cprog)
-        cpl.setContentsMargins(14, 8, 14, 8)
-        cpl.addWidget(QLabel('Check progress:'))
+        cpl.setContentsMargins(18, 10, 18, 10)
+        cpl.setSpacing(12)
+        plab = QLabel('CHECK PROGRESS', objectName='section')
+        cpl.addWidget(plab)
         self.check_progress_bar = QProgressBar()
         self.check_progress_bar.setTextVisible(False)
+        self.check_progress_bar.setMaximumHeight(8)
         cpl.addWidget(self.check_progress_bar, 1)
         self.check_progress_label = QLabel('0 / 0')
+        self.check_progress_label.setStyleSheet(f'color:{c["text_dim"]}; font-size:11px; font-weight:600; min-width:60px;')
+        self.check_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         cpl.addWidget(self.check_progress_label)
         layout.addWidget(cprog)
 
         # Table
         self.table = QTableWidget()
         self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(['Email', 'Password', 'Status', 'Rules', 'Last Check', 'Actions', ''])
+        self.table.setHorizontalHeaderLabels(['EMAIL', 'PASSWORD', 'STATUS', 'NETFLIX RULES', 'LAST CHECK', '', ''])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)
+        hh.setSectionResizeMode(5, QHeaderView.Fixed)
+        hh.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 110)
+        self.table.setColumnWidth(2, 110)
+        self.table.setColumnWidth(3, 80)
+        self.table.setColumnWidth(4, 150)
+        self.table.setColumnWidth(5, 80)
+        self.table.setColumnWidth(6, 50)
         layout.addWidget(self.table, 1)
 
         # Check log
@@ -794,35 +990,74 @@ class MainWindow(QMainWindow):
     # ============ ACTIONS - MANAGE ============
     def refresh_table(self):
         accounts = AccountStore.load()
-        self.lbl_db_count.setText(f'{len(accounts)} accounts')
+        self.lbl_db_count.setText(f'{len(accounts)} account' + ('s' if len(accounts) != 1 else ''))
         self.table.setRowCount(len(accounts))
+        color_map = {
+            'OK': self.C['success'], 'FIXED': self.C['info'],
+            'DISABLED': self.C['warning'], 'NO_RULES': self.C['text_dim'],
+            'LOGIN_FAILED': self.C['danger'],
+        }
+        icon_map = {
+            'OK': '● OK', 'FIXED': '✓ FIXED', 'DISABLED': '⚠ DISABLED',
+            'NO_RULES': '○ NO RULES', 'LOGIN_FAILED': '✕ LOGIN FAIL',
+        }
         for i, a in enumerate(accounts):
-            self.table.setItem(i, 0, QTableWidgetItem(a.get('email', '')))
+            email_item = QTableWidgetItem('  ' + a.get('email', ''))
+            email_item.setForeground(QColor(self.C['text']))
+            self.table.setItem(i, 0, email_item)
+
             pw = a.get('password', '')
-            self.table.setItem(i, 1, QTableWidgetItem('•' * len(pw) if pw else ''))
+            pw_item = QTableWidgetItem('•' * min(len(pw), 10) if pw else '-')
+            pw_item.setForeground(QColor(self.C['text_dim']))
+            pw_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 1, pw_item)
+
             status = a.get('status', '')
-            status_item = QTableWidgetItem(status or '-')
-            color_map = {'OK': self.C['success'], 'FIXED': self.C['info'],
-                         'DISABLED': self.C['warning'], 'NO_RULES': self.C['text_dim'],
-                         'LOGIN_FAILED': self.C['danger']}
-            if status in color_map:
-                status_item.setForeground(QColor(color_map[status]))
+            status_item = QTableWidgetItem(icon_map.get(status, '- ' + (status or 'UNCHECKED')))
+            status_item.setForeground(QColor(color_map.get(status, self.C['text_dim'])))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            f = status_item.font()
+            f.setBold(True)
+            status_item.setFont(f)
             self.table.setItem(i, 2, status_item)
+
             rt = a.get('rules_total', 0)
             re_ = a.get('rules_enabled', 0)
-            self.table.setItem(i, 3, QTableWidgetItem(f'{re_}/{rt}'))
-            self.table.setItem(i, 4, QTableWidgetItem(a.get('last_check', '-')))
-            # Action button: Check
+            # Show Netflix rules count vs expected
+            rules_item = QTableWidgetItem(f'{re_}/{self.EXPECTED_NETFLIX_RULES}' if rt else '-')
+            # Warning if not all Netflix rules are enabled
+            is_complete = re_ >= self.EXPECTED_NETFLIX_RULES
+            rules_item.setForeground(QColor(self.C['success'] if is_complete else self.C['warning']))
+            rules_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 3, rules_item)
+
+            lc = a.get('last_check', '') or '-'
+            lc_item = QTableWidgetItem(lc)
+            lc_item.setForeground(QColor(self.C['text_dim']))
+            lc_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 4, lc_item)
+
+            # Action: Check button (wrapped in container for padding)
+            check_wrap = QWidget()
+            cw = QHBoxLayout(check_wrap)
+            cw.setContentsMargins(4, 4, 4, 4)
             check_btn = QPushButton('Check')
-            check_btn.setObjectName('secondary')
-            check_btn.setMaximumWidth(70)
+            check_btn.setObjectName('row')
+            check_btn.setCursor(Qt.PointingHandCursor)
             check_btn.clicked.connect(lambda _, e=a['email']: self.check_one_email(e))
-            self.table.setCellWidget(i, 5, check_btn)
-            del_btn = QPushButton('×')
-            del_btn.setObjectName('secondary')
-            del_btn.setMaximumWidth(40)
+            cw.addWidget(check_btn)
+            self.table.setCellWidget(i, 5, check_wrap)
+
+            del_wrap = QWidget()
+            dw = QHBoxLayout(del_wrap)
+            dw.setContentsMargins(4, 4, 4, 4)
+            del_btn = QPushButton('✕')
+            del_btn.setObjectName('rowdel')
+            del_btn.setCursor(Qt.PointingHandCursor)
+            del_btn.setToolTip('Delete')
             del_btn.clicked.connect(lambda _, e=a['email']: self.delete_one(e))
-            self.table.setCellWidget(i, 6, del_btn)
+            dw.addWidget(del_btn)
+            self.table.setCellWidget(i, 6, del_wrap)
 
     def add_account_dialog(self):
         from PyQt5.QtWidgets import QInputDialog
@@ -909,7 +1144,11 @@ class MainWindow(QMainWindow):
         self.check_progress_label.setText(f'0 / {len(accounts)}')
         self.check_log.clear()
         self.check_log.append(f'<b>Checking {len(accounts)} account(s)...</b>')
-        self.check_worker = CheckWorker(accounts, self.cb_auto_enable.isChecked(), api, self.check_thread_spin.value())
+        self.check_worker = CheckWorker(
+            accounts, self.cb_auto_enable.isChecked(), self.cb_auto_create.isChecked(),
+            self.check_domain.text().strip() or DEFAULT_REDIRECT_DOMAIN,
+            api, self.check_thread_spin.value()
+        )
         self.check_worker.log_signal.connect(self.log_check)
         self.check_worker.account_checked.connect(lambda r: self.refresh_table())
         self.check_worker.progress.connect(self.on_check_progress)
